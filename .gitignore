@@ -98,6 +98,9 @@ USER.md
 /memory/
 .agent/*.json
 !.agent/workflows/
+!.agent/docs/
+!.agent/skills/
+!.agent/bin/
 /local/
 package-lock.json
 .claude/
@@ -137,3 +140,7 @@ docs/superpowers
 
 # Deprecated changelog fragment workflow
 changelog/fragments/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
