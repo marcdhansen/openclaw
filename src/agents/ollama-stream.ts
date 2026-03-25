@@ -321,12 +321,28 @@ function extractOllamaTools(tools: Tool[] | undefined): OllamaTool[] {
     if (typeof tool.name !== "string" || !tool.name) {
       continue;
     }
+    // For small models, simplify the schema to just required params
+    const params = tool.parameters ?? {};
+    const required = (params.required as string[]) || [];
+    const simplifiedParams: Record<string, unknown> = {
+      type: "object",
+      properties: {},
+      required: required.slice(0, 2), // Only first 2 required params
+    };
+    if (params.properties) {
+      const props = params.properties as Record<string, unknown>;
+      for (const key of required.slice(0, 2)) {
+        if (props[key]) {
+          (simplifiedParams.properties as Record<string, unknown>)[key] = props[key];
+        }
+      }
+    }
     result.push({
       type: "function",
       function: {
         name: tool.name,
-        description: typeof tool.description === "string" ? tool.description : "",
-        parameters: (tool.parameters ?? {}) as Record<string, unknown>,
+        description: "",
+        parameters: simplifiedParams,
       },
     });
   }
@@ -341,6 +357,15 @@ export function buildAssistantMessage(
 ): AssistantMessage {
   const content: (TextContent | ToolCall)[] = [];
 
+  // DEBUG: Log what we received from Ollama
+  console.log(
+    "[DEBUG OLLAMA] response.message:",
+    JSON.stringify({
+      content: response.message.content,
+      tool_calls: response.message.tool_calls,
+    }),
+  );
+
   // Native Ollama reasoning fields are internal model output. The reply text
   // must come from `content`; reasoning visibility is controlled elsewhere.
   const text = response.message.content || "";
@@ -350,6 +375,7 @@ export function buildAssistantMessage(
 
   const toolCalls = response.message.tool_calls;
   if (toolCalls && toolCalls.length > 0) {
+    console.log("[DEBUG OLLAMA] Found tool_calls:", JSON.stringify(toolCalls));
     for (const tc of toolCalls) {
       content.push({
         type: "toolCall",
@@ -431,6 +457,8 @@ function resolveOllamaModelHeaders(model: {
   return model.headers as Record<string, string>;
 }
 
+const OLLAMA_MINIMAL_PROMPT = "You are a helpful assistant. Use tools when asked.";
+
 export function createOllamaStreamFn(
   baseUrl: string,
   defaultHeaders?: Record<string, string>,
@@ -442,12 +470,28 @@ export function createOllamaStreamFn(
 
     const run = async () => {
       try {
-        const ollamaMessages = convertToOllamaMessages(
-          context.messages ?? [],
-          context.systemPrompt,
-        );
+        // For small Ollama models, use minimal prompt to enable tool calling
+        const systemPrompt =
+          model.id.includes("0.5b") || model.id.includes("0.6b")
+            ? OLLAMA_MINIMAL_PROMPT
+            : context.systemPrompt;
 
-        const ollamaTools = extractOllamaTools(context.tools);
+        const ollamaMessages = convertToOllamaMessages(context.messages ?? [], systemPrompt);
+
+        // For very small models (0.5b), only send sessions_spawn tool + minimal messages
+        let ollamaTools = extractOllamaTools(context.tools);
+        let ollamaMessagesFiltered: typeof ollamaMessages = ollamaMessages;
+        if (model.id.includes("0.5b")) {
+          ollamaTools = ollamaTools.filter((t) => t.function.name === "sessions_spawn");
+          // Only send last user message for small models
+          const lastUserMsg = ollamaMessages.filter((m) => m.role === "user").pop();
+          if (lastUserMsg) {
+            ollamaMessagesFiltered = [
+              { role: "system", content: OLLAMA_MINIMAL_PROMPT },
+              lastUserMsg,
+            ];
+          }
+        }
 
         // Ollama defaults to num_ctx=4096 which is too small for large
         // system prompts + many tool definitions. Use model's contextWindow.
@@ -461,7 +505,7 @@ export function createOllamaStreamFn(
 
         const body: OllamaChatRequest = {
           model: model.id,
-          messages: ollamaMessages,
+          messages: ollamaMessagesFiltered,
           stream: true,
           ...(ollamaTools.length > 0 ? { tools: ollamaTools } : {}),
           options: ollamaOptions,
